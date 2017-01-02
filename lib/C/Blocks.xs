@@ -5,6 +5,7 @@
 
 #include "ppport.h"
 #include "libtcc.h"
+#include "pthread.h"
 
 /* ---- Zephram's book of preprocessor hacks ---- */
 #define PERL_VERSION_DECIMAL(r,v,s) (r*1000000 + v*1000 + s)
@@ -31,6 +32,9 @@
 #endif
 
 int (*next_keyword_plugin)(pTHX_ char *, STRLEN, OP **);
+
+/* tcc is not thread-safe so we're protecting it with a mutex. */
+pthread_mutex_t tcc_access_mutex;
 
 typedef void (*my_void_func)(pTHX);
 
@@ -1352,6 +1356,12 @@ int my_keyword_plugin(pTHX_
 	extract_C_code(aTHX_ &data, keyword_type);
 	run_filters(aTHX_ &data, keyword_type);
 	
+
+	/*****************************************************/
+	/* This is the beginning of the mutex protected code */
+	/*****************************************************/
+	pthread_mutex_lock(&tcc_access_mutex);
+
 	TCCState * state = tcc_new();
 	if (!state) croak("Unable to create C::TinyCompiler state!\n");
 	setup_compiler(aTHX_ state, &data);
@@ -1423,6 +1433,11 @@ int my_keyword_plugin(pTHX_
 	/* cleanup */
 	cleanup_c_blocks_data(aTHX_ &data);
 	tcc_delete(state);
+
+	pthread_mutex_unlock(&tcc_access_mutex);
+	/*******************************/
+	/* End of mutex protected code */
+	/*******************************/
 	
 	/* Make the parser count the number of lines correctly */
 	int i;
@@ -1487,6 +1502,12 @@ CODE:
 BOOT:
 	/* Set up the keyword plugin to a useful initial value. */
 	next_keyword_plugin = PL_keyword_plugin;
+
+	if (pthread_mutex_init(&tcc_access_mutex, NULL) != 0) {
+		/* Really shouldn't be happening, but if it does, croak() is
+		 * better than segfaults. */
+		croak("Failed to init tcc access mutex");
+	}
 	
 	my_mem_tail = my_mem_root = malloc(sizeof(executable_memory) + 16384);
 	my_mem_tail->curr_address = (uintptr_t)my_mem_tail->base_address;
