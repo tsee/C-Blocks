@@ -959,6 +959,11 @@ void cleanup_c_blocks_data(pTHX_ c_blocks_data* data) {
 	Safefree(data->xsub_name);
 }
 
+/* This is the right function type for passing to perl's SAVEDESTRUCTOR_X */
+void cleanup_c_blocks_data_callback(pTHX_ void* data) {
+	cleanup_c_blocks_data(aTHX_ (c_blocks_data *)data);
+}
+
 void ensure_perlapi(pTHX_ c_blocks_data * data) {
 	if (data->has_loaded_perlapi) return;
 	
@@ -1331,6 +1336,13 @@ void * my_mem_alloc (size_t n_bytes) {
 int my_keyword_plugin(pTHX_
 	char *keyword_ptr, STRLEN keyword_len, OP **op_ptr
 ) {
+	/* We protect the entire execution of the keyword plugin with a Perl
+	 * pseudo-block ENTER/LEAVE pair. This allows us to simplify memory
+	 * management significantly in the face of exceptions by simply
+	 * registering cleanup handlers instead of manually trapping all
+	 * possible exceptions. */
+	ENTER;
+
 	/* See if this is a keyword we know */
 	int keyword_type = identify_keyword(keyword_ptr, keyword_len);
 	if (!keyword_type)
@@ -1347,6 +1359,9 @@ int my_keyword_plugin(pTHX_
 	/* Create the compilation data struct */
 	c_blocks_data data;
 	initialize_c_blocks_data(aTHX_ &data);
+	/* Note: Since we're passing a pointer to a struct on the stack, the LEAVE
+	 * that triggers this callback MUST happen before the end of THIS function. */
+	SAVEDESTRUCTOR_X(cleanup_c_blocks_data_callback, &data);
 	
 	add_msg_function_decl(aTHX_ &data);
 	if (keyword_type == IS_CBLOCK) add_function_signature_to_block(aTHX_ &data);
@@ -1367,7 +1382,8 @@ int my_keyword_plugin(pTHX_
 	/* This is the beginning of the mutex protected code */
 	/*****************************************************/
         {
-		ENTER;
+		/* SAVEDESTRUCTOR_X ensures that if we leave via an exception, the
+		 * mutex will be unlocked when we hit the LEAVE at the end of this function. */
 		SAVEDESTRUCTOR_X(scope_exit_mutex_unlocker, (void *)&tcc_access_mutex);
 		pthread_mutex_lock(&tcc_access_mutex);
 
@@ -1440,21 +1456,26 @@ int my_keyword_plugin(pTHX_
 		}
 		
 		/* cleanup */
-		cleanup_c_blocks_data(aTHX_ &data);
+		/* Note: c_blocks_data is cleaned up automatically by LEAVE. */
 		tcc_delete(state);
 
-		/* This is done implicitly on LEAVE by SAVEDESTRUCTOR: */
-		/* pthread_mutex_unlock(&tcc_access_mutex); */
-		LEAVE;
+		/* The following is done implicitly on LEAVE by SAVEDESTRUCTOR_X:
+		 *    pthread_mutex_unlock(&tcc_access_mutex);
+		 * while that's not the tightest scope possible for releasing
+		 * the mutex, there's little enough code following this that it's
+		 * not unreasonable to eschew the complexity of having both
+		 * SAVEDESTRUCTOR_X and a manual unlock. */
+
+		/* Make the parser count the number of lines correctly */
+		int i;
+		for (i = 0; i < data.N_newlines; i++) lex_stuff_pv("\n", 0);
 	}
 	/*******************************/
 	/* End of mutex protected code */
 	/*******************************/
-	
-	/* Make the parser count the number of lines correctly */
-	int i;
-	for (i = 0; i < data.N_newlines; i++) lex_stuff_pv("\n", 0);
-	
+
+	LEAVE;
+
 	/* Return success */
 	return KEYWORD_PLUGIN_STMT;
 }
