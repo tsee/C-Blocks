@@ -36,6 +36,12 @@ int (*next_keyword_plugin)(pTHX_ char *, STRLEN, OP **);
 /* tcc is not thread-safe so we're protecting it with a mutex. */
 pthread_mutex_t tcc_access_mutex;
 
+static void scope_exit_mutex_unlocker(pTHX_ void *arg)
+{
+	pthread_mutex_t *mutex_ptr = (pthread_mutex_t *)arg;
+	pthread_mutex_unlock(mutex_ptr);
+}
+
 typedef void (*my_void_func)(pTHX);
 
 typedef struct _available_extended_symtab {
@@ -1360,81 +1366,87 @@ int my_keyword_plugin(pTHX_
 	/*****************************************************/
 	/* This is the beginning of the mutex protected code */
 	/*****************************************************/
-	pthread_mutex_lock(&tcc_access_mutex);
+        {
+		ENTER;
+		SAVEDESTRUCTOR_X(scope_exit_mutex_unlocker, (void *)&tcc_access_mutex);
+		pthread_mutex_lock(&tcc_access_mutex);
 
-	TCCState * state = tcc_new();
-	if (!state) croak("Unable to create C::TinyCompiler state!\n");
-	setup_compiler(aTHX_ state, &data);
-	
-	/* Ask to save state if it's a cshare or clex block*/
-	if (keyword_type == IS_CSHARE || keyword_type == IS_CLEX) {
-		tcc_save_extended_symtab(state);
-	}
-	
-	/* Compile the extracted code */
-	execute_compiler(aTHX_ state, &data, keyword_type);
-	
-	/******************************************/
-	/* Apply the list of symbols and relocate */
-	/******************************************/
-	
-	/* test symbols */
-	if (SvOK(data.add_test_SV)) {
-		tcc_add_symbol(state, "c_blocks_send_msg", _c_blocks_send_msg);
-		tcc_add_symbol(state, "c_blocks_send_bytes", _c_blocks_send_bytes);
-		tcc_add_symbol(state, "c_blocks_get_msg", _c_blocks_get_msg);
-	}
-	
-	/* prepare for relocation; store in a global so that we can free everything
-	 * at the end of the Perl program's execution. Allocate up to on page size
-	 * more memory than we need so that we can align the code at the start of
-	 * the page. */
-	int machine_code_size = tcc_relocate(state, 0);
-	sv_setiv(get_sv("C::Blocks::_last_machine_code_size", GV_ADD | GV_ADDMULTI),
-		machine_code_size);
-	if (machine_code_size > 0) {
-		void * machine_code = my_mem_alloc(machine_code_size);
+		TCCState * state = tcc_new();
+		if (!state) croak("Unable to create C::TinyCompiler state!\n");
+		setup_compiler(aTHX_ state, &data);
+		
+		/* Ask to save state if it's a cshare or clex block*/
+		if (keyword_type == IS_CSHARE || keyword_type == IS_CLEX) {
+			tcc_save_extended_symtab(state);
+		}
+		
+		/* Compile the extracted code */
+		execute_compiler(aTHX_ state, &data, keyword_type);
+		
+		/******************************************/
+		/* Apply the list of symbols and relocate */
+		/******************************************/
+		
+		/* test symbols */
+		if (SvOK(data.add_test_SV)) {
+			tcc_add_symbol(state, "c_blocks_send_msg", _c_blocks_send_msg);
+			tcc_add_symbol(state, "c_blocks_send_bytes", _c_blocks_send_bytes);
+			tcc_add_symbol(state, "c_blocks_get_msg", _c_blocks_get_msg);
+		}
+		
+		/* prepare for relocation; store in a global so that we can free everything
+		 * at the end of the Perl program's execution. Allocate up to on page size
+		 * more memory than we need so that we can align the code at the start of
+		 * the page. */
+		int machine_code_size = tcc_relocate(state, 0);
+		sv_setiv(get_sv("C::Blocks::_last_machine_code_size", GV_ADD | GV_ADDMULTI),
+			machine_code_size);
+		if (machine_code_size > 0) {
+			void * machine_code = my_mem_alloc(machine_code_size);
 #if 0
-		/* Add enough bytes to align on cache line size */
-		SV * machine_code_SV = newSV(machine_code_size + 63);
-		AV * machine_code_cache = get_av("C::Blocks::__code_cache_array", GV_ADDMULTI | GV_ADD);
-		uintptr_t machine_code_loc = (uintptr_t)SvPVX(machine_code_SV);
-		if ((machine_code_loc & 0x63) != 0) {
-			machine_code_loc &= ~0x63;
-			machine_code_loc += 64;
-		}
-		int relocate_returned = tcc_relocate(state, (void*)machine_code_loc);
-		av_push(machine_code_cache, machine_code_SV);
-#endif
-		int relocate_returned = tcc_relocate(state, machine_code);
-		if (SvPOK(data.error_msg_sv)) {
-			/* Look for errors and croak */
-			if (strstr(SvPV_nolen(data.error_msg_sv), "error")) {
-				croak("C::Blocks linker error:\n%s", SvPV_nolen(data.error_msg_sv));
+			/* Add enough bytes to align on cache line size */
+			SV * machine_code_SV = newSV(machine_code_size + 63);
+			AV * machine_code_cache = get_av("C::Blocks::__code_cache_array", GV_ADDMULTI | GV_ADD);
+			uintptr_t machine_code_loc = (uintptr_t)SvPVX(machine_code_SV);
+			if ((machine_code_loc & 0x63) != 0) {
+				machine_code_loc &= ~0x63;
+				machine_code_loc += 64;
 			}
-			/* Otherwise report warnings */
-			my_warnif(aTHX_ "linker", sv_2mortal(newSVsv(data.error_msg_sv)));
+			int relocate_returned = tcc_relocate(state, (void*)machine_code_loc);
+			av_push(machine_code_cache, machine_code_SV);
+#endif
+			int relocate_returned = tcc_relocate(state, machine_code);
+			if (SvPOK(data.error_msg_sv)) {
+				/* Look for errors and croak */
+				if (strstr(SvPV_nolen(data.error_msg_sv), "error")) {
+					croak("C::Blocks linker error:\n%s", SvPV_nolen(data.error_msg_sv));
+				}
+				/* Otherwise report warnings */
+				my_warnif(aTHX_ "linker", sv_2mortal(newSVsv(data.error_msg_sv)));
+			}
+			if (relocate_returned < 0) {
+				croak("C::Blocks linker error: unable to relocate\n");
+			}
 		}
-		if (relocate_returned < 0) {
-			croak("C::Blocks linker error: unable to relocate\n");
+		
+		/********************************************************/
+		/* Build op tree or serialize the symbol table; cleanup */
+		/********************************************************/
+
+		*op_ptr = build_op(aTHX_ state, keyword_type);
+		if (keyword_type == IS_CSUB) extract_xsub(aTHX_ state, &data);
+		else if (keyword_type == IS_CSHARE || keyword_type == IS_CLEX) {
+			serialize_symbol_table(aTHX_ state, &data, keyword_type);
 		}
-	}
-	
-	/********************************************************/
-	/* Build op tree or serialize the symbol table; cleanup */
-	/********************************************************/
+		
+		/* cleanup */
+		cleanup_c_blocks_data(aTHX_ &data);
+		tcc_delete(state);
 
-	*op_ptr = build_op(aTHX_ state, keyword_type);
-	if (keyword_type == IS_CSUB) extract_xsub(aTHX_ state, &data);
-	else if (keyword_type == IS_CSHARE || keyword_type == IS_CLEX) {
-		serialize_symbol_table(aTHX_ state, &data, keyword_type);
+		/* This is done implicitly on LEAVE by SAVEDESTRUCTOR: */
+		/* pthread_mutex_unlock(&tcc_access_mutex); */
+		LEAVE;
 	}
-	
-	/* cleanup */
-	cleanup_c_blocks_data(aTHX_ &data);
-	tcc_delete(state);
-
-	pthread_mutex_unlock(&tcc_access_mutex);
 	/*******************************/
 	/* End of mutex protected code */
 	/*******************************/

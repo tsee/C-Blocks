@@ -7,7 +7,7 @@ use threads;
 
 
 my $thread_sub = sub {
-  for (1..10) {
+  for (1..100) {
     eval qq[
       clex {
         void foo$_() {}
@@ -17,16 +17,27 @@ my $thread_sub = sub {
   }
 };
 
-$thread_sub->();
 
+my $nthreads = 3;
 my @t;
-push @t, threads->create($thread_sub) for 1..5;
+push @t, threads->create($thread_sub) for 1..$nthreads;
+
+warn("Spawned $nthreads threads");
 
 while (@t) {
   sleep 0.1;
   for (my $i = 0; $i < @t; ++$i) {
-    $t[$i]->join, splice(@t, $i, 1), $i-- if $t[$i]->is_joinable;
+    if ($t[$i]->is_joinable) {
+      warn("Thread " . ($i + 1) . " of " . @t . " remaining is joinable");
+      $t[$i]->join;
+      warn("Joined thread");
+      splice(@t, $i, 1);
+      $i--;
+    }
   }
 }
+
+
+warn("Got to end of script");
 
 
