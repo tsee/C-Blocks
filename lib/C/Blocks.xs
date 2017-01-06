@@ -290,7 +290,9 @@ void my_warnif (pTHX_ const char * category, SV * message) {
 /**** Keyword Identification ****/
 /********************************/
 
-enum { IS_CBLOCK = 1, IS_CSHARE, IS_CLEX, IS_CSUB } keyword_type_list;
+/* FIXME IS_CFUN and IS_CSUB don't necessarily have to be disjunct, but
+ * for now it's the easiest to prototype that way. */
+enum { IS_CBLOCK = 1, IS_CSHARE, IS_CLEX, IS_CSUB, IS_CFUN } keyword_type_list;
 
 /* Functions to quickly identify our keywords, assuming that the first letter has
  * already been checked and found to be 'c' */
@@ -304,7 +306,9 @@ int identify_keyword (char * keyword_ptr, STRLEN keyword_len) {
 		if (	keyword_ptr[1] == 'l'
 			&&	keyword_ptr[2] == 'e'
 			&&	keyword_ptr[3] == 'x') return IS_CLEX;
-		
+		if (	keyword_ptr[1] == 'f'
+			&&	keyword_ptr[2] == 'u'
+			&&	keyword_ptr[3] == 'n') return IS_CFUN;
 		return 0;
 	}
 	if (keyword_len == 6) {
@@ -372,6 +376,7 @@ typedef struct c_blocks_data {
 	char * xs_c_name;
 	char * xs_perl_name;
 	char * xsub_name;
+	char * xsub_package;
 	SV * exsymtabs;
 	SV * add_test_SV;
 	SV * code_top;
@@ -917,6 +922,7 @@ void initialize_c_blocks_data(pTHX_ c_blocks_data* data) {
 	data->xs_c_name = 0;
 	data->xs_perl_name = 0;
 	data->xsub_name = 0;
+	data->xsub_package = 0;
 	data->add_test_SV = 0;
 	data->keep_curly_brackets = 1;
 	
@@ -960,6 +966,7 @@ void cleanup_c_blocks_data(pTHX_ void* data_vp) {
 	Safefree(data->xs_c_name);
 	Safefree(data->xs_perl_name);
 	Safefree(data->xsub_name);
+	Safefree(data->xsub_package);
 }
 
 void ensure_perlapi(pTHX_ c_blocks_data * data) {
@@ -1024,6 +1031,7 @@ void fixup_xsub_name(pTHX_ c_blocks_data * data) {
 	data->xsub_name = savepvn(PL_bufptr, data->end - PL_bufptr);
 	
 	/* create the package name */
+	data->xsub_package = strdup(SvPVbyte_nolen(PL_curstname));
 	char * name_buffer = form("%s::%s", SvPVbyte_nolen(PL_curstname),
 		data->xsub_name);
 	data->xs_perl_name = savepv(name_buffer);
@@ -1373,6 +1381,37 @@ void c_blocks_final_cleanup(pTHX_ void *ptr) {
 	}
 }
 
+STATIC void transform_c_to_xsub(pTHX_ c_blocks_data *data) {
+	dSP;
+	int count;
+	ENTER;
+	SAVETMPS;
+	PUSHMARK(SP);
+	XPUSHs(sv_2mortal(newSVpv(data->xsub_package, 0)));
+	XPUSHs(sv_2mortal(newSVpv(data->xsub_name, 0)));
+	XPUSHs(data->code_top);
+	XPUSHs(data->code_main);
+	XPUSHs(data->code_bottom);
+	/* TODO later probably pass custom typemap info here... */
+	PUTBACK;
+	
+	count = call_pv("C::Blocks::XSWrapper::generate_xs", G_SCALAR);
+	SPAGAIN;
+
+	if (count != 1)
+		croak("generate_xs did not return exactly one item. Panic.");
+	
+	SV *gen_code = POPs;
+	sv_setpvs(data->code_top, "");
+	sv_setsv(data->code_main, gen_code);
+	/* SvREFCNT_dec(gen_code); Not necessary because gen_code shouldn't be owner by the stack in the first place. */
+	sv_setpvs(data->code_bottom, "");
+
+	PUTBACK;
+	FREETMPS;
+	LEAVE;
+}
+
 
 /* See below: my_keyword_plugin is a shim around this function */
 STATIC int _my_keyword_plugin(pTHX_ char *keyword_ptr,
@@ -1388,6 +1427,33 @@ STATIC int _my_keyword_plugin(pTHX_ char *keyword_ptr,
 	add_msg_function_decl(aTHX_ data);
 	if (keyword_type == IS_CBLOCK) add_function_signature_to_block(aTHX_ data);
 	else if (keyword_type == IS_CSUB) fixup_xsub_name(aTHX_ data);
+	else if (keyword_type == IS_CFUN) {
+		/* FIXME for now, the idea is to hack things up just for a proof of principle.
+		 * Ultimately desired syntax could be like this:
+		 *
+		 * cfun double square(double x)
+		 *      :typemap($my_typemap)
+		 * {
+		 *    return x*x;
+		 * }
+		 *
+		 * But for now, I want to avoid having to write a C function signature parser
+		 * with the Perl lexer and instead use some horrible Perl regexen to do the same,
+		 * so I'll instead have this syntax:
+		 *
+		 * cfun square {
+		 *   double square(double x)
+		 *     // implied {} around the code because they won't be there in the future
+		 *     return x*x;
+		 * }
+		 *
+		 * With: a) the types being parsed out of the first line of the C code explicitly.
+		 *       b) The first and last line of the C code being discarded.
+		 *       c) Custom typemaps not supported.
+		 *       d) The XSUB name coming from "cfun square" already.
+		 */
+		fixup_xsub_name(aTHX_ data);
+	}
 	else if (keyword_type == IS_CSHARE || keyword_type == IS_CLEX) {
 		data->keep_curly_brackets = 0;
 	}
@@ -1399,6 +1465,10 @@ STATIC int _my_keyword_plugin(pTHX_ char *keyword_ptr,
 	extract_C_code(aTHX_ data, keyword_type);
 	run_filters(aTHX_ data, keyword_type);
 	
+	if (keyword_type == IS_CFUN) {
+		transform_c_to_xsub(aTHX_ data);
+	}
+
 	TCCState * state = tcc_new();
 	if (!state) croak("Unable to create C::TinyCompiler state!\n");
 	setup_compiler(aTHX_ state, data);
@@ -1462,7 +1532,10 @@ STATIC int _my_keyword_plugin(pTHX_ char *keyword_ptr,
 	/********************************************************/
 
 	*op_ptr = build_op(aTHX_ state, keyword_type);
-	if (keyword_type == IS_CSUB) extract_xsub(aTHX_ state, data);
+	
+	if (keyword_type == IS_CSUB || keyword_type == IS_CFUN) {
+		extract_xsub(aTHX_ state, data);
+	}
 	else if (keyword_type == IS_CSHARE || keyword_type == IS_CLEX) {
 		serialize_symbol_table(aTHX_ state, data, keyword_type);
 	}

@@ -9,6 +9,8 @@ use warnings::register qw(import compiler linker);
 use Alien::TinyCCx;
 use XSLoader;
 
+use C::Blocks::XSWrapper;
+
 # Use David Golden's version numbering suggestions. Note that we have to call
 # the XSLoader before evaling the version string because XS modules check the
 # version *string*, not the version *number*, at boot time.
